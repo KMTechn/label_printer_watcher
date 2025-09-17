@@ -1,0 +1,6 @@
+{
+    "remnant_printer": "잔량 라벨 프린터 이름을 여기에 입력",
+    "remnant_base_folder": "C:\\Sync\\labels\\remnant_labels",
+    "defective_printer": "불량 라벨 프린터 이름을 여기에 입력",
+    "defective_base_folder": "C:\\Sync\\labels\\defective_labels"
+}
