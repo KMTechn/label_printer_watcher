@@ -5,7 +5,7 @@ name: Create Release for Label Printer Watcher
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.*'
 
 # 권한 설정: GitHub Releases에 파일을 쓰기 위한 권한
 permissions:
@@ -29,18 +29,17 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 3. 필요한 라이브러리 설치 (requirements.txt 사용)
+      # 3. 필요한 라이브러리 설치
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. PyInstaller로 .exe 파일 빌드
+      # 4. PyInstaller로 .exe 파일 빌드 (assets 폴더 포함)
       - name: Build executable with PyInstaller
-        run: pyinstaller --name "Label_Printer_Watcher" --onefile label_printer_watcher.py
+        run: pyinstaller --name "Label_Printer_Watcher" --onefile --add-data "assets;assets" label_printer_watcher.py
 
       # 5. 빌드된 .exe 파일을 ZIP으로 압축
-      #    --onefile 모드의 결과물은 dist 폴더 안의 .exe 파일입니다.
       - name: Zip the executable
         run: |
           Compress-Archive -Path dist/Label_Printer_Watcher.exe -DestinationPath "Label_Printer_Watcher-${{ github.ref_name }}.zip"
