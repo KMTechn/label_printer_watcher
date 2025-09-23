@@ -23,6 +23,7 @@ try:
     import win32gui
     import pywintypes
     from PIL import ImageWin
+    import winreg # <--- 추가
 except ImportError:
     # 프로그램 실행 중에는 설치할 수 없으므로, 사용자에게 안내 메시지를 표시합니다.
     print("오류: 'pywin32' 모듈을 찾을 수 없습니다. 'pip install pywin32' 명령으로 설치해주세요.")
@@ -35,7 +36,7 @@ except ImportError:
 DEFAULT_CONFIG = {
     "REPO_OWNER": "KMTechn",
     "REPO_NAME": "Label_Printer_Watcher",
-    "APP_VERSION": "v1.4.6", # 시스템 프린터 여백 설정 적용 오류 수정
+    "APP_VERSION": "v1.0.1", # 윈도우 시작 시 자동 실행 기능 추가
     "remnant_printer": "",
     "defective_printer": "",
     "remnant_base_folder": "",
@@ -135,7 +136,6 @@ def threaded_update_check():
         else:
             print("사용자가 업데이트를 거부했습니다.")
 
-# ############### [수정됨] print_label 함수 ###############
 def print_label(image_path: str, printer_name: str, devmode=None):
     if not win32print:
         print("오류: pywin32 모듈이 없어 인쇄할 수 없습니다.")
@@ -157,8 +157,6 @@ def print_label(image_path: str, printer_name: str, devmode=None):
         
         hdc = win32ui.CreateDCFromHandle(hDC)
 
-        # DEVMODE가 적용된 DC의 인쇄 가능 영역을 가져옵니다.
-        # 이 영역의 (0,0)은 사용자가 설정한 여백이 이미 적용된 시작점입니다.
         printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
         printable_height = hdc.GetDeviceCaps(win32con.VERTRES)
 
@@ -180,7 +178,6 @@ def print_label(image_path: str, printer_name: str, devmode=None):
         
         dib = ImageWin.Dib(img)
         
-        # 물리적 여백(PHYSICALOFFSET)을 더하지 않고, 논리적 인쇄 영역 내에서 중앙 정렬합니다.
         draw_x = (printable_width - draw_width) // 2
         draw_y = (printable_height - draw_height) // 2
         
@@ -221,8 +218,14 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"라벨 자동 출력기 ({CONFIG['APP_VERSION']})")
-        self.geometry("700x650")
+        self.geometry("700x700")
         
+        # ############### [추가됨] 자동 실행 레지스트리 관련 변수 ###############
+        self.app_name = "LabelPrinterWatcher"
+        # pyinstaller로 빌드된 .exe 경로 또는 .py 스크립트 경로를 가져옴
+        self.app_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+        self.reg_key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
         try:
             logo_path = resource_path('assets/logo.png')
             self.logo_image = ImageTk.PhotoImage(file=logo_path)
@@ -296,6 +299,15 @@ class App(tk.Tk):
         tk.Button(defective_frame, text="찾아보기", command=lambda: self.select_folder(self.defective_folder_var)).grid(row=1, column=2, padx=5, pady=5)
         defective_frame.columnconfigure(1, weight=1)
         
+        # ############### [추가됨] 자동 실행 설정 프레임 ###############
+        startup_frame = ttk.LabelFrame(settings_frame, text="옵션", padding=10)
+        startup_frame.pack(fill=tk.X, pady=(15, 5))
+
+        self.startup_var = tk.BooleanVar()
+        self.startup_checkbutton = ttk.Checkbutton(startup_frame, text="윈도우 시작 시 자동 실행", variable=self.startup_var, command=self.toggle_startup)
+        self.startup_checkbutton.pack(anchor="w")
+        self.startup_var.set(self.check_startup_registry())
+
         button_frame = tk.Frame(settings_frame)
         button_frame.pack(fill=tk.X, pady=20)
 
@@ -306,6 +318,49 @@ class App(tk.Tk):
         status_bar = tk.Label(self, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor='w', padx=5)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
     
+    # ############### [추가됨] 자동 실행 레지스트리 관리 함수들 ###############
+    def toggle_startup(self):
+        if self.startup_var.get():
+            self.set_startup_registry()
+        else:
+            self.remove_startup_registry()
+
+    def set_startup_registry(self):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.reg_key_path, 0, winreg.KEY_WRITE)
+            winreg.SetValueEx(key, self.app_name, 0, winreg.REG_SZ, self.app_path)
+            winreg.CloseKey(key)
+            print("자동 실행 설정: 레지스트리에 등록되었습니다.")
+        except Exception as e:
+            messagebox.showerror("오류", f"자동 실행 설정에 실패했습니다:\n{e}")
+            print(f"[오류] 자동 실행 레지스트리 등록 실패: {e}")
+
+    def remove_startup_registry(self):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.reg_key_path, 0, winreg.KEY_WRITE)
+            winreg.DeleteValue(key, self.app_name)
+            winreg.CloseKey(key)
+            print("자동 실행 해제: 레지스트리에서 제거되었습니다.")
+        except FileNotFoundError:
+            # 이미 없는 경우이므로 정상이므로 무시
+            print("자동 실행 해제: 레지스트리에 등록되어 있지 않습니다.")
+            pass
+        except Exception as e:
+            messagebox.showerror("오류", f"자동 실행 해제에 실패했습니다:\n{e}")
+            print(f"[오류] 자동 실행 레지스트리 제거 실패: {e}")
+
+    def check_startup_registry(self):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.reg_key_path, 0, winreg.KEY_READ)
+            winreg.QueryValueEx(key, self.app_name)
+            winreg.CloseKey(key)
+            return True
+        except FileNotFoundError:
+            return False
+        except Exception as e:
+            print(f"[오류] 자동 실행 상태 확인 실패: {e}")
+            return False
+            
     def open_printer_properties(self, printer_type):
         if not win32print:
             messagebox.showerror("모듈 오류", "'pywin32'가 설치되지 않았습니다.")
