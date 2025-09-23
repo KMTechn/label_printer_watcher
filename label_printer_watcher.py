@@ -6,41 +6,81 @@ import subprocess
 import threading
 import requests
 import zipfile
-from datetime import date
+from datetime import date, datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, ttk, filedialog
 from queue import Queue
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 import pystray
 
+# pywin32는 pyinstaller로 빌드 시 자동으로 포함되지 않을 수 있어, 별도 import가 필요할 수 있습니다.
+try:
+    import win32print
+    import win32ui
+    import win32con
+    import win32gui
+    import pywintypes
+    from PIL import ImageWin
+except ImportError:
+    # 프로그램 실행 중에는 설치할 수 없으므로, 사용자에게 안내 메시지를 표시합니다.
+    print("오류: 'pywin32' 모듈을 찾을 수 없습니다. 'pip install pywin32' 명령으로 설치해주세요.")
+    win32print = None
+
+
 # #####################################################################
-# 1. 사용자 설정 (이 부분을 직접 수정하세요)
+# 1. 기본 설정 (config.json 파일이 없을 경우 사용)
 # #####################################################################
-CONFIG = {
+DEFAULT_CONFIG = {
     "REPO_OWNER": "KMTechn",
     "REPO_NAME": "Label_Printer_Watcher",
-    "APP_VERSION": "v1.0.0", # 경로 수정 버전
-    "remnant_printer": "Beeprt BY-482BT_무선",
-    "defective_printer": "Beeprt BY-482BT_무선",
-    "remnant_base_folder": "C:\\Sync\\labels\\remnant_labels",
-    "defective_base_folder": "C:\\Sync\\labels\\defective_labels"
+    "APP_VERSION": "v1.4.6", # 시스템 프린터 여백 설정 적용 오류 수정
+    "remnant_printer": "",
+    "defective_printer": "",
+    "remnant_base_folder": "",
+    "defective_base_folder": "",
 }
+CONFIG_FILE = 'config.json'
 # #####################################################################
 
-# [수정됨] .py 또는 .exe 파일의 실제 위치를 기준으로 경로를 찾는 함수
+# 설정 관리
+def load_config():
+    config = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            try:
+                user_config = json.load(f)
+                config.update(user_config)
+            except json.JSONDecodeError:
+                print(f"오류: '{CONFIG_FILE}' 파일 형식이 잘못되었습니다. 기본 설정으로 복원합니다.")
+                save_config(config)
+                return config
+
+    config['APP_VERSION'] = DEFAULT_CONFIG['APP_VERSION']
+    config['REPO_OWNER'] = DEFAULT_CONFIG['REPO_OWNER']
+    config['REPO_NAME'] = DEFAULT_CONFIG['REPO_NAME']
+    
+    save_config(config)
+        
+    return config
+
+def save_config(config_data):
+    config_to_save = config_data.copy()
+    config_to_save.pop('remnant_devmode', None)
+    config_to_save.pop('defective_devmode', None)
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config_to_save, f, indent=4, ensure_ascii=False)
+
+CONFIG = load_config()
+
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
-        # PyInstaller는 임시 폴더를 만들고 _MEIPASS에 경로를 저장합니다.
         base_path = sys._MEIPASS
     except Exception:
-        # 일반 .py 스크립트로 실행될 때는 파일 자신의 위치를 기준으로 합니다.
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
-# (자동 업데이트 및 인쇄 관련 함수들은 이전과 동일)
 def check_for_updates():
     try:
         owner, repo, version = CONFIG["REPO_OWNER"], CONFIG["REPO_NAME"], CONFIG["APP_VERSION"]
@@ -95,36 +135,93 @@ def threaded_update_check():
         else:
             print("사용자가 업데이트를 거부했습니다.")
 
-def print_label(image_path: str, printer_name: str):
+# ############### [수정됨] print_label 함수 ###############
+def print_label(image_path: str, printer_name: str, devmode=None):
+    if not win32print:
+        print("오류: pywin32 모듈이 없어 인쇄할 수 없습니다.")
+        return
     if not os.path.exists(image_path):
         print(f"인쇄 실패: 파일 '{image_path}'를 찾을 수 없습니다.")
         return
+
+    hDC = None
     try:
         print(f"인쇄 시도: '{os.path.basename(image_path)}' -> '{printer_name}'")
-        subprocess.run(["mspaint", "/p", image_path, printer_name], check=True, shell=True)
+        
+        if devmode:
+            print(" - 시스템 프린터 설정(DEVMODE)을 적용합니다.")
+            hDC = win32gui.CreateDC("WINSPOOL", printer_name, devmode)
+        else:
+            print(" - 기본 프린터 설정을 사용합니다.")
+            hDC = win32gui.CreateDC("WINSPOOL", printer_name, None)
+        
+        hdc = win32ui.CreateDCFromHandle(hDC)
+
+        # DEVMODE가 적용된 DC의 인쇄 가능 영역을 가져옵니다.
+        # 이 영역의 (0,0)은 사용자가 설정한 여백이 이미 적용된 시작점입니다.
+        printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
+        printable_height = hdc.GetDeviceCaps(win32con.VERTRES)
+
+        hdc.StartDoc(image_path)
+        hdc.StartPage()
+
+        img = Image.open(image_path)
+        img_width, img_height = img.size
+
+        img_aspect = img_width / img_height
+        printable_aspect = printable_width / printable_height
+
+        if img_aspect > printable_aspect:
+            draw_width = printable_width
+            draw_height = int(draw_width / img_aspect)
+        else:
+            draw_height = printable_height
+            draw_width = int(draw_height * img_aspect)
+        
+        dib = ImageWin.Dib(img)
+        
+        # 물리적 여백(PHYSICALOFFSET)을 더하지 않고, 논리적 인쇄 영역 내에서 중앙 정렬합니다.
+        draw_x = (printable_width - draw_width) // 2
+        draw_y = (printable_height - draw_height) // 2
+        
+        dib.draw(hdc.GetHandleOutput(), (draw_x, draw_y, draw_x + draw_width, draw_y + draw_height))
+
+        hdc.EndPage()
+        hdc.EndDoc()
         print(f"성공: 인쇄 명령을 전송했습니다.")
+
+    except (win32ui.error, pywintypes.error) as e:
+        print(f"오류: 인쇄 중 오류가 발생했습니다. 프린터('{printer_name}') 설정을 확인해주세요.\n{e}")
     except Exception as e:
-        print(f"오류: 인쇄 중 오류가 발생했습니다. 프린터('{printer_name}')가 연결되어 있는지 확인해주세요.\n{e}")
+        print(f"오류: 예기치 않은 인쇄 오류가 발생했습니다.\n{e}")
+    finally:
+        if hDC:
+            win32gui.DeleteDC(hDC)
+
 
 class LabelPrintHandler(FileSystemEventHandler):
-    def __init__(self, printer_name: str):
+    def __init__(self, printer_name: str, get_devmode_func):
         self.printer_name = printer_name
+        self.get_devmode_func = get_devmode_func
         self._last_printed_time = {}
+
     def on_created(self, event):
         if event.is_directory or not event.src_path.lower().endswith('.png'):
             return
-        filepath = event.src.path
+        filepath = event.src_path
         current_time = time.time()
         if self._last_printed_time.get(filepath) and current_time - self._last_printed_time.get(filepath, 0) < 2:
             return
         self._last_printed_time[filepath] = current_time
-        threading.Thread(target=print_label, args=(filepath, self.printer_name), daemon=True).start()
+        
+        devmode = self.get_devmode_func()
+        threading.Thread(target=print_label, args=(filepath, self.printer_name, devmode), daemon=True).start()
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"라벨 자동 출력기 ({CONFIG['APP_VERSION']})")
-        self.geometry("700x400")
+        self.geometry("700x650")
         
         try:
             logo_path = resource_path('assets/logo.png')
@@ -139,6 +236,10 @@ class App(tk.Tk):
         self.observer = None
         self.current_watch_date = None
         self.is_running = True
+        self.restart_monitoring = threading.Event()
+        
+        self.remnant_devmode = None
+        self.defective_devmode = None
 
         self.create_widgets()
         self.redirect_stdout()
@@ -149,15 +250,239 @@ class App(tk.Tk):
         threading.Thread(target=threaded_update_check, daemon=True).start()
 
     def create_widgets(self):
-        main_frame = tk.Frame(self, padx=10, pady=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        log_label = tk.Label(main_frame, text="실행 로그", font=("Malgun Gothic", 10, "bold"))
-        log_label.pack(anchor="w")
-        self.log_text = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, font=("Consolas", 10), state='disabled')
-        self.log_text.pack(fill=tk.BOTH, expand=True, pady=(5, 10))
+        self.notebook = ttk.Notebook(self, padding=10)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        log_frame = ttk.Frame(self.notebook)
+        self.notebook.add(log_frame, text='실행 로그')
+        
+        log_label = tk.Label(log_frame, text="실시간 실행 로그", font=("Malgun Gothic", 10, "bold"))
+        log_label.pack(anchor="w", pady=(0, 5))
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, font=("Consolas", 10), state='disabled')
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        settings_frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(settings_frame, text='인쇄 설정')
+
+        remnant_frame = ttk.LabelFrame(settings_frame, text="잔량 라벨 설정", padding=10)
+        remnant_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(remnant_frame, text="프린터 선택:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.remnant_printer_var = tk.StringVar(value=CONFIG.get("remnant_printer", ""))
+        tk.Entry(remnant_frame, textvariable=self.remnant_printer_var, width=40).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        tk.Button(remnant_frame, text="찾아보기", command=lambda: self.select_printer(self.remnant_printer_var)).grid(row=0, column=2, padx=5, pady=5)
+        
+        tk.Button(remnant_frame, text="시스템 프린터 설정", command=lambda: self.open_printer_properties('remnant')).grid(row=0, column=3, padx=5, pady=5)
+
+        tk.Label(remnant_frame, text="감시 폴더:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.remnant_folder_var = tk.StringVar(value=CONFIG.get("remnant_base_folder", ""))
+        tk.Entry(remnant_frame, textvariable=self.remnant_folder_var, width=40).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        tk.Button(remnant_frame, text="찾아보기", command=lambda: self.select_folder(self.remnant_folder_var)).grid(row=1, column=2, padx=5, pady=5)
+        remnant_frame.columnconfigure(1, weight=1)
+
+        defective_frame = ttk.LabelFrame(settings_frame, text="불량 라벨 설정", padding=10)
+        defective_frame.pack(fill=tk.X, pady=5)
+
+        tk.Label(defective_frame, text="프린터 선택:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.defective_printer_var = tk.StringVar(value=CONFIG.get("defective_printer", ""))
+        tk.Entry(defective_frame, textvariable=self.defective_printer_var, width=40).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        tk.Button(defective_frame, text="찾아보기", command=lambda: self.select_printer(self.defective_printer_var)).grid(row=0, column=2, padx=5, pady=5)
+        
+        tk.Button(defective_frame, text="시스템 프린터 설정", command=lambda: self.open_printer_properties('defective')).grid(row=0, column=3, padx=5, pady=5)
+
+        tk.Label(defective_frame, text="감시 폴더:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.defective_folder_var = tk.StringVar(value=CONFIG.get("defective_base_folder", ""))
+        tk.Entry(defective_frame, textvariable=self.defective_folder_var, width=40).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        tk.Button(defective_frame, text="찾아보기", command=lambda: self.select_folder(self.defective_folder_var)).grid(row=1, column=2, padx=5, pady=5)
+        defective_frame.columnconfigure(1, weight=1)
+        
+        button_frame = tk.Frame(settings_frame)
+        button_frame.pack(fill=tk.X, pady=20)
+
+        tk.Button(button_frame, text="설정 저장", command=self.save_settings, height=2, bg="#4CAF50", fg="white", font=("Malgun Gothic", 10, "bold")).pack(side=tk.LEFT, expand=True, padx=5)
+        tk.Button(button_frame, text="테스트 라벨 생성", command=self.create_test_label, height=2, bg="#2196F3", fg="white", font=("Malgun Gothic", 10, "bold")).pack(side=tk.RIGHT, expand=True, padx=5)
+
         self.status_var = tk.StringVar(value="초기화 중...")
         status_bar = tk.Label(self, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor='w', padx=5)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+    
+    def open_printer_properties(self, printer_type):
+        if not win32print:
+            messagebox.showerror("모듈 오류", "'pywin32'가 설치되지 않았습니다.")
+            return
+
+        printer_name = self.remnant_printer_var.get() if printer_type == 'remnant' else self.defective_printer_var.get()
+
+        if not printer_name:
+            messagebox.showwarning("프린터 선택 필요", "먼저 프린터를 선택하고 저장해주세요.")
+            return
+
+        try:
+            PRINTER_DEFAULTS = {"DesiredAccess": win32print.PRINTER_ALL_ACCESS}
+            h_printer = win32print.OpenPrinter(printer_name, PRINTER_DEFAULTS)
+            
+            properties = win32print.GetPrinter(h_printer, 2)
+            p_devmode = properties['pDevMode']
+            
+            result = win32print.DocumentProperties(self.winfo_id(), h_printer, printer_name, p_devmode, p_devmode, win32con.DM_IN_PROMPT | win32con.DM_OUT_BUFFER | win32con.DM_IN_BUFFER)
+            
+            if result == win32con.IDOK:
+                win32print.SetPrinter(h_printer, 2, properties, 0)
+                
+                if printer_type == 'remnant':
+                    self.remnant_devmode = p_devmode
+                elif printer_type == 'defective':
+                    self.defective_devmode = p_devmode
+                
+                print(f"프린터({printer_name})의 시스템 기본 설정이 영구적으로 변경되었습니다.")
+                messagebox.showinfo("설정 완료", f"'{printer_name}' 프린터의 기본 설정이 **영구적으로** 변경되었습니다.")
+            else:
+                print("사용자가 프린터 설정 변경을 취소했습니다.")
+                messagebox.showinfo("취소", "프린터 설정 변경이 취소되었습니다.")
+
+            win32print.ClosePrinter(h_printer)
+
+        except pywintypes.error as e:
+            if e.winerror == 5:
+                 messagebox.showerror("권한 오류", f"프린터 설정을 변경할 권한이 없습니다.\n프로그램을 관리자 권한으로 실행해주세요.")
+                 print(f"[오류] 프린터 설정 변경 권한 부족: {e}")
+            else:
+                messagebox.showerror("설정 오류", f"프린터 속성을 여는 중 오류 발생:\n{e}\n프린터 이름이 올바른지 확인해주세요.")
+                print(f"[오류] 프린터 속성 열기 실패: {e}")
+        except Exception as e:
+            messagebox.showerror("알 수 없는 오류", f"예상치 못한 오류 발생:\n{e}")
+            print(f"[오류] 프린터 속성 열기 중 예외 발생: {e}")
+
+    def get_current_settings(self):
+        return {}
+
+    def select_folder(self, var):
+        folder_selected = filedialog.askdirectory()
+        if folder_selected:
+            var.set(folder_selected)
+
+    def get_printers(self):
+        if not win32print:
+            messagebox.showerror("모듈 오류", "'pywin32' 라이브러리가 설치되지 않았습니다.\n프로그램을 종료하고 'pip install pywin32'를 실행해주세요.")
+            return []
+        try:
+            printers = [printer[2] for printer in win32print.EnumPrinters(2)]
+            if not printers:
+                print("[정보] 설치된 프린터를 찾을 수 없습니다.")
+            return printers
+        except Exception as e:
+            print(f"[오류] 프린터 목록을 가져오는 데 실패했습니다: {e}")
+            messagebox.showerror("프린터 조회 실패", f"프린터 목록을 가져오는 중 오류가 발생했습니다.\n{e}")
+            return []
+
+    def select_printer(self, var):
+        printers = self.get_printers()
+        if not printers:
+            messagebox.showinfo("프린터 없음", "시스템에 설치된 프린터가 없습니다.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("프린터 선택")
+        win.geometry("350x300")
+        win.transient(self)
+        win.grab_set()
+
+        tk.Label(win, text="설치된 프린터를 선택하세요:", pady=5).pack()
+
+        list_frame = tk.Frame(win)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        scrollbar.config(command=listbox.yview)
+
+        for printer in printers:
+            listbox.insert(tk.END, printer)
+
+        def on_ok():
+            selected_indices = listbox.curselection()
+            if selected_indices:
+                selected_printer = listbox.get(selected_indices[0])
+                var.set(selected_printer)
+            win.destroy()
+        
+        def on_double_click(event):
+            on_ok()
+
+        listbox.bind("<Double-Button-1>", on_double_click)
+
+        ok_button = tk.Button(win, text="확인", command=on_ok, width=10)
+        ok_button.pack(pady=10)
+
+        current_printer = var.get()
+        if current_printer in printers:
+            idx = printers.index(current_printer)
+            listbox.selection_set(idx)
+            listbox.see(idx)
+
+        win.wait_window()
+
+    def save_settings(self):
+        global CONFIG
+        new_config = self.get_current_settings()
+        new_config["remnant_printer"] = self.remnant_printer_var.get()
+        new_config["remnant_base_folder"] = self.remnant_folder_var.get()
+        new_config["defective_printer"] = self.defective_printer_var.get()
+        new_config["defective_base_folder"] = self.defective_folder_var.get()
+        
+        try:
+            save_config(new_config)
+            CONFIG = load_config()
+            messagebox.showinfo("저장 완료", "설정이 성공적으로 저장되었습니다.\n감시자가 재시작됩니다.")
+            print("\n[설정 저장] 새로운 설정이 적용되었습니다. 감시자를 재시작합니다.")
+            self.restart_monitoring.set()
+        except Exception as e:
+            messagebox.showerror("저장 실패", f"설정 저장 중 오류가 발생했습니다:\n{e}")
+            print(f"[오류] 설정 저장 실패: {e}")
+
+    def create_test_label(self):
+        target_folder = self.remnant_folder_var.get()
+        if not target_folder or not os.path.isdir(target_folder):
+            messagebox.showwarning("폴더 오류", "잔량 라벨 감시 폴더가 올바르게 설정되지 않았습니다.\n설정 탭에서 폴더를 지정해주세요.")
+            return
+
+        try:
+            today_str = date.today().strftime('%Y-%m-%d')
+            today_folder = os.path.join(target_folder, today_str)
+            os.makedirs(today_folder, exist_ok=True)
+
+            width, height = 400, 200
+            img = Image.new('RGB', (width, height), color = 'white')
+            d = ImageDraw.Draw(img)
+
+            try:
+                font = ImageFont.truetype("malgun.ttf", 20)
+            except IOError:
+                font = ImageFont.load_default()
+
+            text = "테스트 라벨입니다."
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            d.text((20,20), "--- 샘플 인쇄 ---", fill=(0,0,0), font=font)
+            d.text((20,60), text, fill=(0,0,0), font=font)
+            d.text((20,100), f"생성 시간: {timestamp}", fill=(0,0,0), font=font)
+            d.rectangle([(5,5), (width-5, height-5)], outline ="black", width=2)
+
+            filename = f"test_label_{int(time.time())}.png"
+            filepath = os.path.join(today_folder, filename)
+            img.save(filepath)
+
+            messagebox.showinfo("생성 완료", f"테스트 라벨이 생성되었습니다.\n경로: {filepath}\n\n잠시 후 설정된 프린터로 자동 인쇄됩니다.")
+            print(f"[테스트] 샘플 라벨 생성 완료: {filepath}")
+
+        except Exception as e:
+            messagebox.showerror("생성 실패", f"테스트 라벨 생성 중 오류가 발생했습니다:\n{e}")
+            print(f"[오류] 테스트 라벨 생성 실패: {e}")
+
 
     def add_log(self, message):
         self.log_text.config(state='normal')
@@ -186,35 +511,48 @@ class App(tk.Tk):
         print("--- 자동 라벨 출력 프로그램 시작 ---\n")
         while self.is_running:
             today = date.today()
-            if today != self.current_watch_date:
+            if today != self.current_watch_date or self.restart_monitoring.is_set():
                 if self.observer and self.observer.is_alive():
-                    print(f"\n날짜가 변경되었습니다. ({self.current_watch_date} -> {today}) 감시자를 재시작합니다.")
+                    print(f"\n감시자를 재시작합니다. (사유: {'설정변경' if self.restart_monitoring.is_set() else '날짜변경'})")
                     self.observer.stop()
                     self.observer.join()
+                
+                self.restart_monitoring.clear()
                 self.observer = Observer()
                 self.current_watch_date = today
                 today_str = today.strftime('%Y-%m-%d')
+                
                 print(f"\n[{today_str}] 날짜의 폴더 감시를 설정합니다.")
                 remnant_base, remnant_printer = CONFIG.get("remnant_base_folder"), CONFIG.get("remnant_printer")
-                if remnant_base and remnant_printer:
+                if remnant_base and remnant_printer and os.path.isdir(remnant_base):
                     remnant_path_today = os.path.join(remnant_base, today_str)
                     os.makedirs(remnant_path_today, exist_ok=True)
                     print(f" - 잔량 폴더 감시 중: {remnant_path_today} -> [{remnant_printer}]")
-                    self.observer.schedule(LabelPrintHandler(remnant_printer), remnant_path_today, recursive=False)
+                    self.observer.schedule(LabelPrintHandler(remnant_printer, lambda: self.remnant_devmode), remnant_path_today, recursive=False)
+                else:
+                    print(f" - 잔량 폴더 설정이 올바르지 않아 감시를 시작할 수 없습니다.")
+
                 defective_base, defective_printer = CONFIG.get("defective_base_folder"), CONFIG.get("defective_printer")
-                if defective_base and defective_printer:
+                if defective_base and defective_printer and os.path.isdir(defective_base):
                     defective_path_today = os.path.join(defective_base, today_str)
                     os.makedirs(defective_path_today, exist_ok=True)
                     print(f" - 불량 폴더 감시 중: {defective_path_today} -> [{defective_printer}]")
-                    self.observer.schedule(LabelPrintHandler(defective_printer), defective_path_today, recursive=False)
+                    self.observer.schedule(LabelPrintHandler(defective_printer, lambda: self.defective_devmode), defective_path_today, recursive=False)
+                else:
+                    print(f" - 불량 폴더 설정이 올바르지 않아 감시를 시작할 수 없습니다.")
+
                 if self.observer.emitters:
                     self.observer.start()
                     self.status_var.set(f"모니터링 중... (감시 날짜: {today_str})")
                     print("모니터링 시작...\n")
                 else:
                     self.status_var.set("오류: 감시할 폴더가 설정되지 않았습니다.")
-                    print("\n감시할 폴더가 설정되지 않았습니다. 코드 상단의 CONFIG 설정을 확인해주세요.")
-            time.sleep(60)
+                    print("\n감시할 폴더가 설정되지 않았습니다. '인쇄 설정' 탭에서 설정을 확인해주세요.")
+            
+            for _ in range(60):
+                if not self.is_running or self.restart_monitoring.is_set():
+                    break
+                time.sleep(1)
 
     def setup_tray_icon(self):
         try:
